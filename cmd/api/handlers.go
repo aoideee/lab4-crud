@@ -148,6 +148,77 @@ func (app *applicationDependencies) listBooksHandler(w http.ResponseWriter, r *h
 	}
 }
 
+// replaceBookHandler handles PUT /v1/books/:id.
+// PUT is a FULL replacement — the client must supply every field.
+// If any required field is missing the request is rejected with 422.
+// Use PATCH (/v1/books/:id) instead if you only want to update specific fields.
+func (app *applicationDependencies) replaceBookHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract and validate the :id URL parameter.
+	id, err := app.readIDParam(r)
+	if err != nil {
+		app.badRequestResponse(w, r, err)
+		return
+	}
+
+	// Confirm the book exists before replacing it.
+	book, err := app.models.Books.Get(id)
+	if err != nil {
+		switch {
+		case errors.Is(err, data.ErrRecordNotFound):
+			app.notFoundResponse(w, r)
+		default:
+			app.serverErrorResponse(w, r, err)
+		}
+		return
+	}
+
+	// Decode the complete replacement body. We reuse CreateBookInput because
+	// PUT requires every field to be provided (same required fields as a create).
+	var input data.CreateBookInput
+	err = app.readJSON(w, r, &input)
+	if err != nil {
+		app.badRequestResponse(w, r, err)
+		return
+	}
+
+	// --- Validation: all fields are required for a full replacement ---
+	v := validator.New()
+	v.Check(input.Title != "", "title", "must be provided")
+	v.Check(len(input.Title) <= 255, "title", "must not be more than 255 characters long")
+	v.Check(input.ISBN != "", "isbn", "must be provided")
+	v.Check(len(input.ISBN) == 13, "isbn", "must be exactly 13 characters long")
+	v.Check(input.Publisher != "", "publisher", "must be provided")
+	v.Check(input.PublicationYear > 0, "publication_year", "must be provided")
+	v.Check(input.PublicationYear <= 2026, "publication_year", "must not be in the future")
+	v.Check(input.MinimumAge >= 0, "minimum_age", "must be zero or greater")
+
+	if !v.Valid() {
+		app.failedValidationResponse(w, r, v.Errors)
+		return
+	}
+
+	// Overwrite all fields on the existing book record.
+	book.Title = input.Title
+	book.ISBN = input.ISBN
+	book.Publisher = input.Publisher
+	book.PublicationYear = input.PublicationYear
+	book.MinimumAge = input.MinimumAge
+	book.Description = input.Description
+
+	// Persist the replaced book.
+	err = app.models.Books.Update(book)
+	if err != nil {
+		app.serverErrorResponse(w, r, err)
+		return
+	}
+
+	// Respond with the fully-replaced book.
+	err = app.writeJSON(w, http.StatusOK, envelope{"book": book}, nil)
+	if err != nil {
+		app.serverErrorResponse(w, r, err)
+	}
+}
+
 // updateBookHandler handles PATCH /v1/books/:id.
 // It fetches the existing record with Get(id), applies only the non-nil input
 // fields, validates the result, and saves the changes with Update().

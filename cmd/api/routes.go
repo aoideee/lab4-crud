@@ -32,7 +32,8 @@ func (app *applicationDependencies) routes() http.Handler {
 	router.HandlerFunc(http.MethodPost,   "/v1/books",     app.createBookHandler)
 	router.HandlerFunc(http.MethodGet,    "/v1/books/:id", app.showBookHandler)
 	router.HandlerFunc(http.MethodGet,    "/v1/books",     app.listBooksHandler)
-	router.HandlerFunc(http.MethodPatch,  "/v1/books/:id", app.updateBookHandler)
+	router.HandlerFunc(http.MethodPut,    "/v1/books/:id", app.replaceBookHandler) // Full replacement
+	router.HandlerFunc(http.MethodPatch,  "/v1/books/:id", app.updateBookHandler)  // Partial update
 	router.HandlerFunc(http.MethodDelete, "/v1/books/:id", app.deleteBookHandler)
 
 	// Wrap with middleware: recoverPanic is outermost so it catches panics
