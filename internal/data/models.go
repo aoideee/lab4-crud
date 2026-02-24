@@ -3,7 +3,10 @@ package data
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"math"
+	"strings"
 )
 
 // Models is a top-level container that groups all database model types together.
@@ -18,6 +21,64 @@ type Models struct {
 func NewModels(db *sql.DB) Models {
 	return Models{
 		Books: BookModel{DB: db},
+	}
+}
+
+// ErrRecordNotFound is returned when a query finds no matching row.
+var ErrRecordNotFound = errors.New("record not found")
+
+// Filters holds pagination and sorting parameters extracted from URL query strings.
+type Filters struct {
+	Page         int      // Current page number (1-indexed)
+	PageSize     int      // Number of records per page
+	Sort         string   // Column name to sort by (prefix with "-" for DESC)
+	SortSafeList []string // Allowed sort columns to prevent SQL injection
+}
+
+// sortColumn returns the validated column name for ORDER BY, defaulting to book_id.
+func (f Filters) sortColumn() string {
+	for _, safe := range f.SortSafeList {
+		if f.Sort == safe {
+			return strings.TrimPrefix(f.Sort, "-")
+		}
+	}
+	return "book_id" // safe fallback
+}
+
+// sortDirection returns "ASC" or "DESC" based on the Sort prefix.
+func (f Filters) sortDirection() string {
+	if strings.HasPrefix(f.Sort, "-") {
+		return "DESC"
+	}
+	return "ASC"
+}
+
+// limit returns the SQL LIMIT value derived from PageSize.
+func (f Filters) limit() int { return f.PageSize }
+
+// offset returns the SQL OFFSET value derived from Page and PageSize.
+func (f Filters) offset() int { return (f.Page - 1) * f.PageSize }
+
+// Metadata contains pagination information returned alongside list responses.
+type Metadata struct {
+	CurrentPage  int `json:"current_page,omitempty"`
+	PageSize     int `json:"page_size,omitempty"`
+	FirstPage    int `json:"first_page,omitempty"`
+	LastPage     int `json:"last_page,omitempty"`
+	TotalRecords int `json:"total_records,omitempty"`
+}
+
+// calculateMetadata computes page metadata from total record count and filter values.
+func calculateMetadata(totalRecords, page, pageSize int) Metadata {
+	if totalRecords == 0 {
+		return Metadata{}
+	}
+	return Metadata{
+		CurrentPage:  page,
+		PageSize:     pageSize,
+		FirstPage:    1,
+		LastPage:     int(math.Ceil(float64(totalRecords) / float64(pageSize))),
+		TotalRecords: totalRecords,
 	}
 }
 
@@ -55,28 +116,68 @@ func (m BookModel) Insert(book *Book) error {
 	return nil
 }
 
-// GetAll retrieves every book from the database, ordered by book_id ascending.
-// Returns a slice of pointers so callers can modify records without extra copies.
-func (m BookModel) GetAll() ([]*Book, error) {
+// Get retrieves a single book by its primary key.
+// Returns ErrRecordNotFound if no book with the given id exists.
+func (m BookModel) Get(id int64) (*Book, error) {
+	if id < 1 {
+		return nil, ErrRecordNotFound
+	}
+
 	query := `
-        SELECT book_id, title, isbn, publisher, publication_year, minimum_age, description, created_at, updated_at
-        FROM books
-        ORDER BY book_id`
+		SELECT book_id, title, isbn, publisher, publication_year, minimum_age, description, created_at, updated_at
+		FROM books
+		WHERE book_id = $1`
+
+	var book Book
+	err := m.DB.QueryRow(query, id).Scan(
+		&book.ID,
+		&book.Title,
+		&book.ISBN,
+		&book.Publisher,
+		&book.PublicationYear,
+		&book.MinimumAge,
+		&book.Description,
+		&book.CreatedAt,
+		&book.UpdatedAt,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil, ErrRecordNotFound
+		default:
+			return nil, err
+		}
+	}
+	return &book, nil
+}
+
+// GetAll retrieves a paginated, sorted list of books.
+// It uses a COUNT(*) OVER() window function so only one round-trip is needed.
+// Returns the book slice and pagination Metadata.
+func (m BookModel) GetAll(filters Filters) ([]*Book, Metadata, error) {
+	// Build query dynamically using the validated sort column and direction.
+	query := fmt.Sprintf(`
+		SELECT count(*) OVER(), book_id, title, isbn, publisher, publication_year, minimum_age, description, created_at, updated_at
+		FROM books
+		ORDER BY %s %s, book_id ASC
+		LIMIT $1 OFFSET $2`, filters.sortColumn(), filters.sortDirection())
 
 	// Execute the SELECT and get a result set (rows).
-	rows, err := m.DB.Query(query)
+	rows, err := m.DB.Query(query, filters.limit(), filters.offset())
 	if err != nil {
-		return nil, err
+		return nil, Metadata{}, err
 	}
 	// Always close the result set when we are done to free the database connection.
 	defer rows.Close()
 
+	totalRecords := 0
 	books := []*Book{}
 
 	// Iterate over each row and scan the columns into a Book struct.
 	for rows.Next() {
 		var book Book
 		err := rows.Scan(
+			&totalRecords, // COUNT(*) OVER() – same value on every row
 			&book.ID,
 			&book.Title,
 			&book.ISBN,
@@ -88,25 +189,26 @@ func (m BookModel) GetAll() ([]*Book, error) {
 			&book.UpdatedAt,
 		)
 		if err != nil {
-			return nil, err
+			return nil, Metadata{}, err
 		}
 		books = append(books, &book)
 	}
 
 	// Check for any error that occurred while iterating the rows.
 	if err = rows.Err(); err != nil {
-		return nil, err
+		return nil, Metadata{}, err
 	}
 
-	return books, nil
+	metadata := calculateMetadata(totalRecords, filters.Page, filters.PageSize)
+	return books, metadata, nil
 }
 
 // Delete removes the book with the given id from the database.
-// Returns an error if the id is invalid or if no matching record exists.
+// Returns ErrRecordNotFound if no matching record exists.
 func (m BookModel) Delete(id int64) error {
 	// Guard against obviously bad IDs before touching the database.
 	if id < 1 {
-		return fmt.Errorf("invalid ID")
+		return ErrRecordNotFound
 	}
 
 	query := `DELETE FROM books WHERE book_id = $1`
@@ -124,7 +226,7 @@ func (m BookModel) Delete(id int64) error {
 
 	// If no rows were deleted, the book didn't exist.
 	if rowsAffected == 0 {
-		return fmt.Errorf("record not found")
+		return ErrRecordNotFound
 	}
 
 	return nil

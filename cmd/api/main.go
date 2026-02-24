@@ -1,14 +1,13 @@
 // Package main is the entry point for the library API server.
-// It wires together configuration, the database connection, and the HTTP router.
+// It wires together configuration, the database connection, and the HTTP router,
+// then delegates to the serve() method in server.go for startup and graceful shutdown.
 package main
 
 import (
 	"context"
 	"database/sql"
 	"flag"
-	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"time"
 
@@ -20,7 +19,7 @@ import (
 // appVersion is the current version of the API, shown in logs.
 const appVersion = "1.0.0"
 
-// serverConfig holds all the values that can be tweaked at startup via command-line flags.
+// serverConfig holds all values that can be tweaked at startup via command-line flags.
 type serverConfig struct {
 	port        int    // TCP port the HTTP server listens on (default 4000)
 	environment string // Runtime environment: development, staging, or production
@@ -30,7 +29,7 @@ type serverConfig struct {
 }
 
 // applicationDependencies bundles every shared resource that HTTP handlers need.
-// A pointer to this struct is passed as the receiver on all handler and route methods.
+// A pointer to this struct is the receiver on all handler, route, and middleware methods.
 type applicationDependencies struct {
 	config serverConfig // Server configuration loaded from flags
 	logger *slog.Logger // Structured logger that writes to stdout
@@ -38,7 +37,7 @@ type applicationDependencies struct {
 }
 
 // main is the application entry point.
-// It parses flags, opens the database, wires up dependencies, and starts the HTTP server.
+// It parses flags, opens the database, wires up dependencies, and calls serve().
 func main() {
 	var settings serverConfig
 
@@ -69,22 +68,12 @@ func main() {
 		models: data.NewModels(db),
 	}
 
-	// Configure and create the HTTP server.
-	apiServer := &http.Server{
-		Addr:         fmt.Sprintf(":%d", settings.port),
-		Handler:      appInstance.routes(), // All routes are registered here.
-		IdleTimeout:  time.Minute,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		ErrorLog:     slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	// serve() starts the HTTP server and blocks until a shutdown signal is received.
+	err = appInstance.serve()
+	if err != nil {
+		logger.Error(err.Error())
+		os.Exit(1)
 	}
-
-	logger.Info("starting server", "address", apiServer.Addr, "environment", settings.environment)
-
-	// ListenAndServe blocks until the server shuts down or encounters a fatal error.
-	err = apiServer.ListenAndServe()
-	logger.Error(err.Error())
-	os.Exit(1)
 }
 
 // openDB opens a PostgreSQL connection pool using the DSN stored in settings,

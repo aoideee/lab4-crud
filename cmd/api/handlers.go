@@ -1,31 +1,47 @@
 // cmd/api/handlers.go
 // This file contains all HTTP request handlers for the books resource.
 // Each handler is a method on *applicationDependencies so it has access
-// to the logger and database models.
+// to the logger, models, and config without global variables.
 package main
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/aoideee/lab4-tyshadaniels/internal/data"
+	"github.com/aoideee/lab4-tyshadaniels/internal/validator"
 )
 
 // createBookHandler handles POST /v1/books.
-// It reads a JSON body containing the new book's details, inserts a record
-// into the database, and responds with the created book (including its
-// database-assigned ID and timestamps) and a 201 Created status.
+// It reads a JSON body, validates all fields with a Validator, inserts the record,
+// and responds with 201 Created plus the fully-populated book.
 func (app *applicationDependencies) createBookHandler(w http.ResponseWriter, r *http.Request) {
 	var input data.CreateBookInput
 
-	// Decode the incoming JSON body into our input struct using the safe readJSON helper.
-	// readJSON enforces a 1MB limit, rejects unknown fields, and ensures a single value.
+	// Decode the request body safely (1MB cap, no unknown fields).
 	err := app.readJSON(w, r, &input)
 	if err != nil {
 		app.badRequestResponse(w, r, err)
 		return
 	}
 
-	// Map the validated input fields onto a new Book struct.
+	// --- Validation ---
+	v := validator.New()
+	v.Check(input.Title != "", "title", "must be provided")
+	v.Check(len(input.Title) <= 255, "title", "must not be more than 255 characters long")
+	v.Check(input.ISBN != "", "isbn", "must be provided")
+	v.Check(len(input.ISBN) == 13, "isbn", "must be exactly 13 characters long")
+	v.Check(input.Publisher != "", "publisher", "must be provided")
+	v.Check(input.PublicationYear > 0, "publication_year", "must be provided")
+	v.Check(input.PublicationYear <= 2026, "publication_year", "must not be in the future")
+	v.Check(input.MinimumAge >= 0, "minimum_age", "must be zero or greater")
+
+	if !v.Valid() {
+		app.failedValidationResponse(w, r, v.Errors)
+		return
+	}
+
+	// Map the validated input onto a new Book struct.
 	book := &data.Book{
 		Title:           input.Title,
 		ISBN:            input.ISBN,
@@ -35,15 +51,14 @@ func (app *applicationDependencies) createBookHandler(w http.ResponseWriter, r *
 		Description:     input.Description,
 	}
 
-	// Persist the book to the database.
-	// Insert() also writes the auto-generated ID and timestamps back into book.
+	// Persist the book; Insert() writes the auto-generated ID and timestamps back.
 	err = app.models.Books.Insert(book)
 	if err != nil {
 		app.serverErrorResponse(w, r, err)
 		return
 	}
 
-	// Respond with the fully-populated book and a 201 Created status.
+	// Respond with the created book and 201 Created.
 	err = app.writeJSON(w, http.StatusCreated, envelope{"book": book}, nil)
 	if err != nil {
 		app.serverErrorResponse(w, r, err)
@@ -51,65 +66,112 @@ func (app *applicationDependencies) createBookHandler(w http.ResponseWriter, r *
 }
 
 // showBookHandler handles GET /v1/books/:id.
-// It parses the :id URL parameter, fetches all books, and returns the one
-// whose ID matches. Responds 404 if no book with that ID exists.
+// It calls Get(id) directly on the model — no full table scan needed.
 func (app *applicationDependencies) showBookHandler(w http.ResponseWriter, r *http.Request) {
-	// readIDParam extracts and validates the :id URL parameter.
+	// Extract and validate the :id URL parameter.
 	id, err := app.readIDParam(r)
 	if err != nil {
 		app.badRequestResponse(w, r, err)
 		return
 	}
 
-	// Retrieve all books and scan for the requested ID.
-	books, err := app.models.Books.GetAll()
+	// Fetch the single record from the database by primary key.
+	book, err := app.models.Books.Get(id)
 	if err != nil {
-		app.serverErrorResponse(w, r, err)
+		switch {
+		case errors.Is(err, data.ErrRecordNotFound):
+			app.notFoundResponse(w, r)
+		default:
+			app.serverErrorResponse(w, r, err)
+		}
 		return
 	}
 
-	for _, b := range books {
-		if b.ID == id {
-			err = app.writeJSON(w, http.StatusOK, envelope{"book": b}, nil)
-			if err != nil {
-				app.serverErrorResponse(w, r, err)
-			}
-			return
-		}
+	err = app.writeJSON(w, http.StatusOK, envelope{"book": book}, nil)
+	if err != nil {
+		app.serverErrorResponse(w, r, err)
 	}
-
-	// No book matched the requested ID.
-	app.notFoundResponse(w, r)
 }
 
 // listBooksHandler handles GET /v1/books.
-// It fetches every book from the database and returns them as a JSON array.
+// It reads optional page, page_size, and sort query parameters, validates them,
+// and returns a paginated list of books together with pagination metadata.
 func (app *applicationDependencies) listBooksHandler(w http.ResponseWriter, r *http.Request) {
-	books, err := app.models.Books.GetAll()
+	// The struct we will fill from the URL query string.
+	var queryInput struct {
+		Page     int
+		PageSize int
+		Sort     string
+	}
+
+	// Read query parameters with sensible defaults.
+	qs := r.URL.Query()
+	queryInput.Page = app.readInt(qs, "page", 1)
+	queryInput.PageSize = app.readInt(qs, "page_size", 10)
+	queryInput.Sort = app.readString(qs, "sort", "book_id")
+
+	// --- Validation ---
+	v := validator.New()
+	v.Check(queryInput.Page > 0, "page", "must be greater than zero")
+	v.Check(queryInput.Page <= 10_000_000, "page", "must be a maximum of 10 million")
+	v.Check(queryInput.PageSize > 0, "page_size", "must be greater than zero")
+	v.Check(queryInput.PageSize <= 100, "page_size", "must be a maximum of 100")
+	v.Check(validator.In(queryInput.Sort, "book_id", "title", "publication_year", "-book_id", "-title", "-publication_year"),
+		"sort", "invalid sort value")
+
+	if !v.Valid() {
+		app.failedValidationResponse(w, r, v.Errors)
+		return
+	}
+
+	// Build the Filters value to pass to GetAll.
+	filters := data.Filters{
+		Page:     queryInput.Page,
+		PageSize: queryInput.PageSize,
+		Sort:     queryInput.Sort,
+		SortSafeList: []string{
+			"book_id", "title", "publication_year",
+			"-book_id", "-title", "-publication_year",
+		},
+	}
+
+	books, metadata, err := app.models.Books.GetAll(filters)
 	if err != nil {
 		app.serverErrorResponse(w, r, err)
 		return
 	}
 
-	err = app.writeJSON(w, http.StatusOK, envelope{"books": books}, nil)
+	// Include both the books and the pagination metadata in the response envelope.
+	err = app.writeJSON(w, http.StatusOK, envelope{"books": books, "metadata": metadata}, nil)
 	if err != nil {
 		app.serverErrorResponse(w, r, err)
 	}
 }
 
 // updateBookHandler handles PATCH /v1/books/:id.
-// It reads a partial JSON body (UpdateBookInput), finds the existing book,
-// applies only the non-nil fields from the input, and saves the changes.
-// Responds 404 if the book does not exist.
+// It fetches the existing record with Get(id), applies only the non-nil input
+// fields, validates the result, and saves the changes with Update().
 func (app *applicationDependencies) updateBookHandler(w http.ResponseWriter, r *http.Request) {
-	// Parse and validate the :id URL parameter.
+	// Extract and validate the :id URL parameter.
 	id, err := app.readIDParam(r)
 	if err != nil {
 		app.badRequestResponse(w, r, err)
 		return
 	}
 
-	// Decode the partial update fields from the request body.
+	// Fetch the existing record directly by primary key — no table scan.
+	book, err := app.models.Books.Get(id)
+	if err != nil {
+		switch {
+		case errors.Is(err, data.ErrRecordNotFound):
+			app.notFoundResponse(w, r)
+		default:
+			app.serverErrorResponse(w, r, err)
+		}
+		return
+	}
+
+	// Decode the partial update from the request body.
 	var input data.UpdateBookInput
 	err = app.readJSON(w, r, &input)
 	if err != nil {
@@ -117,29 +179,7 @@ func (app *applicationDependencies) updateBookHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	// Fetch all books and locate the one we intend to update.
-	books, err := app.models.Books.GetAll()
-	if err != nil {
-		app.serverErrorResponse(w, r, err)
-		return
-	}
-
-	var book *data.Book
-	for _, b := range books {
-		if b.ID == id {
-			book = b
-			break
-		}
-	}
-
-	// Return 404 if the book wasn't found.
-	if book == nil {
-		app.notFoundResponse(w, r)
-		return
-	}
-
-	// Apply only the fields that were actually provided in the request body.
-	// Each field is a pointer; nil means "not provided, leave as-is".
+	// Apply only the fields that were actually provided (non-nil pointers).
 	if input.Title != nil {
 		book.Title = *input.Title
 	}
@@ -159,7 +199,23 @@ func (app *applicationDependencies) updateBookHandler(w http.ResponseWriter, r *
 		book.Description = *input.Description
 	}
 
-	// Persist the updated book back to the database.
+	// --- Validation on the merged (existing + updated) values ---
+	v := validator.New()
+	v.Check(book.Title != "", "title", "must be provided")
+	v.Check(len(book.Title) <= 255, "title", "must not be more than 255 characters long")
+	v.Check(book.ISBN != "", "isbn", "must be provided")
+	v.Check(len(book.ISBN) == 13, "isbn", "must be exactly 13 characters long")
+	v.Check(book.Publisher != "", "publisher", "must be provided")
+	v.Check(book.PublicationYear > 0, "publication_year", "must be provided")
+	v.Check(book.PublicationYear <= 2026, "publication_year", "must not be in the future")
+	v.Check(book.MinimumAge >= 0, "minimum_age", "must be zero or greater")
+
+	if !v.Valid() {
+		app.failedValidationResponse(w, r, v.Errors)
+		return
+	}
+
+	// Persist the changes.
 	err = app.models.Books.Update(book)
 	if err != nil {
 		app.serverErrorResponse(w, r, err)
@@ -174,22 +230,20 @@ func (app *applicationDependencies) updateBookHandler(w http.ResponseWriter, r *
 }
 
 // deleteBookHandler handles DELETE /v1/books/:id.
-// It parses the :id URL parameter, deletes the matching record from the database,
-// and responds with a confirmation message.
-// Responds 404 if no book with that ID exists.
+// It deletes the matching record and responds with a success message.
+// Returns 404 if no book with that ID exists.
 func (app *applicationDependencies) deleteBookHandler(w http.ResponseWriter, r *http.Request) {
-	// Parse and validate the :id URL parameter.
+	// Extract and validate the :id URL parameter.
 	id, err := app.readIDParam(r)
 	if err != nil {
 		app.badRequestResponse(w, r, err)
 		return
 	}
 
-	// Delete the book from the database.
 	err = app.models.Books.Delete(id)
 	if err != nil {
-		switch err.Error() {
-		case "record not found":
+		switch {
+		case errors.Is(err, data.ErrRecordNotFound):
 			app.notFoundResponse(w, r)
 		default:
 			app.serverErrorResponse(w, r, err)
@@ -197,7 +251,6 @@ func (app *applicationDependencies) deleteBookHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	// Respond with a success message.
 	err = app.writeJSON(w, http.StatusOK, envelope{"message": "book successfully deleted"}, nil)
 	if err != nil {
 		app.serverErrorResponse(w, r, err)
