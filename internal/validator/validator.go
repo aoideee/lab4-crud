@@ -52,6 +52,14 @@ func In(value string, list ...string) bool {
 	return false
 }
 
+// PermittedValue adds an error for key with message only when value is not
+// present in the list. Use this to validate that a sort parameter is allowed.
+func (v *Validator) PermittedValue(ok bool, key, message string) {
+	if !ok {
+		v.AddError(key, message)
+	}
+}
+
 // Matches returns true if value matches the provided compiled regexp.
 func Matches(value string, rx *regexp.Regexp) bool {
 	return rx.MatchString(value)
