@@ -73,6 +73,8 @@ func (app *applicationDependencies) rateLimit(next http.Handler) http.Handler {
 			}
 
 			mu.Lock()
+
+			// If the IP address is not already in the clients map, create a new client with a rate limiter.
 			if _, found := clients[ip]; !found {
 				clients[ip] = &client{
 					limiter: rate.NewLimiter(rate.Limit(app.config.limiter.rps), app.config.limiter.burst),
@@ -80,6 +82,7 @@ func (app *applicationDependencies) rateLimit(next http.Handler) http.Handler {
 			}
 			clients[ip].lastSeen = time.Now()
 
+			// Check if the client's rate limiter allows the request. If not, send a 429 Too Many Requests response.
 			if !clients[ip].limiter.Allow() {
 				mu.Unlock()
 				app.rateLimitExceededResponse(w, r)

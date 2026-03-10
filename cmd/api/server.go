@@ -15,10 +15,8 @@ import (
 	"time"
 )
 
-// serve builds the HTTP server, starts it in a background goroutine, then
-// blocks until it receives a SIGINT or SIGTERM signal. On signal receipt it
-// initiates a graceful shutdown: in-flight requests are given 20 seconds to
-// complete before the server is forcefully stopped.
+// serve starts the HTTP server and waits for a shutdown signal (SIGINT/SIGTERM).
+// When signaled, it gracefully shuts down with a 20-second timeout for in-flight requests.
 func (app *applicationDependencies) serve() error {
 	// Configure the HTTP server.
 	apiServer := &http.Server {
@@ -30,33 +28,30 @@ func (app *applicationDependencies) serve() error {
         ErrorLog: slog.NewLogLogger(app.logger.Handler(), slog.LevelError),
     }
 
-	// shutdownErr receives any error returned by Shutdown().
+	// shutdownErr receives errors from the shutdown goroutine.
 	shutdownErr := make(chan error)
 
 	// Background goroutine: wait for a shutdown signal then gracefully stop.
 	go func() {
-		// quit is a buffered channel so the signal package never blocks.
+		// quit is buffered so the signal package never blocks.
 		quit := make(chan os.Signal, 1)
 
-		// Notify quit on SIGINT (Ctrl+C) and SIGTERM (kill / Docker stop).
+		// Listen for SIGINT (Ctrl+C) and SIGTERM (kill / Docker stop).
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 		// Block until a signal arrives.
 		s := <-quit
 		app.logger.Info("shutting down server", "signal", s.String())
 
-		// Create a context with a 20-second timeout. Active requests must
-		// complete within this window or they will be abandoned.
+		// Create a context with a 20-second timeout for active requests.
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 
-		// Shutdown stops accepting new connections and waits for active
-		// requests to finish, respecting the context deadline.
+		// Initiate graceful shutdown.
 		shutdownErr <- apiServer.Shutdown(ctx)
 	}()
 
-	// Start the server. ListenAndServe always returns a non-nil error; we
-	// treat ErrServerClosed as normal (it means Shutdown was called).
+	// Start the server. ListenAndServe always returns a non-nil error.
 	app.logger.Info("starting server", "address", apiServer.Addr, "environment", app.config.environment)
 
 	err := apiServer.ListenAndServe()
@@ -64,7 +59,7 @@ func (app *applicationDependencies) serve() error {
 		return err
 	}
 
-	// Wait for the shutdown goroutine to finish and collect its error.
+	// Wait for the shutdown goroutine to finish.
 	err = <-shutdownErr
 	if err != nil {
 		return err
