@@ -32,31 +32,30 @@ func (app *applicationDependencies) recoverPanic(next http.Handler) http.Handler
 	})
 }
 
-// client holds a per-IP rate limiter and the time it was last seen.
-// lastSeen lets us evict old entries so the map does not grow forever.
-type client struct {
-	limiter  *rate.Limiter
-	lastSeen time.Time
-}
-
-// rateLimit implements per-IP token-bucket rate limiting using the
-// golang.org/x/time/rate package. Each unique IP gets its own limiter
-// seeded with 2 tokens per second and a burst capacity of 4.
-// A background goroutine cleans up entries that have not been seen in 3 minutes.
+// rateLimit is a middleware that limits the number of requests a client can make
+// in a given time period. It uses the golang.org/x/time/rate package to implement
+// a token bucket algorithm for rate limiting.
 func (app *applicationDependencies) rateLimit(next http.Handler) http.Handler {
-	// clients maps IP addresses to their individual rate limiters.
+	// client holds a per-IP rate limiter and the time it was last seen.
+	// lastSeen lets us evict old entries so the map does not grow forever.
+	type client struct {
+		limiter  *rate.Limiter
+		lastSeen time.Time
+	}
+
 	var (
 		mu      sync.Mutex
 		clients = make(map[string]*client)
 	)
 
-	// Cleanup goroutine: remove stale IP entries every minute.
+	// background goroutine to remove clients that haven't been seen for more than 3 minutes.
+	// This prevents the map from growing indefinitely if a client makes a single request and then disappears.
 	go func() {
 		for {
 			time.Sleep(time.Minute)
 			mu.Lock()
-			for ip, c := range clients {
-				if time.Since(c.lastSeen) > 3*time.Minute {
+			for ip, client := range clients {
+				if time.Since(client.lastSeen) > 3*time.Minute {
 					delete(clients, ip)
 				}
 			}
@@ -65,29 +64,29 @@ func (app *applicationDependencies) rateLimit(next http.Handler) http.Handler {
 	}()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract just the IP from the RemoteAddr (strips the port).
-		ip, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			app.serverErrorResponse(w, r, err)
-			return
-		}
-
-		mu.Lock()
-		// Create a new limiter for this IP if we have not seen it before.
-		if _, found := clients[ip]; !found {
-			clients[ip] = &client{
-				limiter: rate.NewLimiter(rate.Limit(2), 4), // 2 req/s, burst of 4
+		if app.config.limiter.enabled {
+			// Extract the client's IP address.
+			ip, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				app.serverErrorResponse(w, r, err)
+				return
 			}
-		}
-		clients[ip].lastSeen = time.Now()
 
-		// Allow() consumes one token; returns false if the bucket is empty.
-		if !clients[ip].limiter.Allow() {
+			mu.Lock()
+			if _, found := clients[ip]; !found {
+				clients[ip] = &client{
+					limiter: rate.NewLimiter(rate.Limit(app.config.limiter.rps), app.config.limiter.burst),
+				}
+			}
+			clients[ip].lastSeen = time.Now()
+
+			if !clients[ip].limiter.Allow() {
+				mu.Unlock()
+				app.rateLimitExceededResponse(w, r)
+				return
+			}
 			mu.Unlock()
-			app.rateLimitExceededResponse(w, r)
-			return
 		}
-		mu.Unlock()
 
 		next.ServeHTTP(w, r)
 	})

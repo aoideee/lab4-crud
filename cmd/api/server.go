@@ -55,7 +55,7 @@ func (app *applicationDependencies) serve() error {
 
 	// Start the server. ListenAndServe always returns a non-nil error; we
 	// treat ErrServerClosed as normal (it means Shutdown was called).
-	app.logger.Info("starting server", "address", apiServer.Addr, "environment", app.config.environment)
+	app.logger.Info("starting server", "address", apiServer.Addr, "environment", app.config.environment, "limiter_enabled", app.config.limiter.enabled)
 
 	err := apiServer.ListenAndServe()
 	if !errors.Is(err, http.ErrServerClosed) {

@@ -12,7 +12,13 @@ run: run/api
 ## run/api: Run the API server application
 .PHONY: run/api
 run/api:
-	go run ./cmd/api -db-dsn=${CLMS_DB_DSN}
+	@echo 'Running application…'
+	@go run ./cmd/api -port=4000 \
+		-env=development \
+		-limiter-burst=5 \
+		-limiter-rps=2 \
+		-limiter-enabled=true \
+		-db-dsn=${CLMS_DB_DSN}
 
 ## db/psql: Connect to the library database using psql
 .PHONY: db/psql
