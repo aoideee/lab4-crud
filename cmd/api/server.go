@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,13 +21,14 @@ import (
 // complete before the server is forcefully stopped.
 func (app *applicationDependencies) serve() error {
 	// Configure the HTTP server.
-	apiServer := &http.Server{
-		Addr:         fmt.Sprintf(":%d", app.config.port),
-		Handler:      app.routes(),
-		IdleTimeout:  time.Minute,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-	}
+	apiServer := &http.Server {
+        Addr: fmt.Sprintf(":%d", app.config.port),
+        Handler: app.routes(),
+        IdleTimeout: time.Minute,
+        ReadTimeout: 5 * time.Second,
+        WriteTimeout: 10 * time.Second,
+        ErrorLog: slog.NewLogLogger(app.logger.Handler(), slog.LevelError),
+    }
 
 	// shutdownErr receives any error returned by Shutdown().
 	shutdownErr := make(chan error)
@@ -55,7 +57,7 @@ func (app *applicationDependencies) serve() error {
 
 	// Start the server. ListenAndServe always returns a non-nil error; we
 	// treat ErrServerClosed as normal (it means Shutdown was called).
-	app.logger.Info("starting server", "address", apiServer.Addr, "environment", app.config.environment, "limiter_enabled", app.config.limiter.enabled)
+	app.logger.Info("starting server", "address", apiServer.Addr, "environment", app.config.environment)
 
 	err := apiServer.ListenAndServe()
 	if !errors.Is(err, http.ErrServerClosed) {
@@ -67,6 +69,8 @@ func (app *applicationDependencies) serve() error {
 	if err != nil {
 		return err
 	}
+
+	time.Sleep(3 * time.Second)
 
 	app.logger.Info("server stopped", "address", apiServer.Addr)
 	return nil
