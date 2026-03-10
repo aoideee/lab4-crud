@@ -58,5 +58,6 @@ func (app *applicationDependencies) failedValidationResponse(w http.ResponseWrit
 
 // rateLimitExceededResponse sends a 429 Too Many Requests error.
 func (app *applicationDependencies) rateLimitExceededResponse(w http.ResponseWriter, r *http.Request) {
-	app.errorResponse(w, r, http.StatusTooManyRequests, "rate limit exceeded")
+	message := "rate limit exceeded: please wait before making more requests"
+	app.errorResponse(w, r, http.StatusTooManyRequests, message)
 }

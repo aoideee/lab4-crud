@@ -26,6 +26,11 @@ type serverConfig struct {
 	db          struct {
 		dsn string // PostgreSQL Data Source Name (connection string)
 	}
+	limiter struct {
+		rps     float64 // Requests per second
+		burst   int     // Maximum burst size for rate limiter
+		enabled bool    // Enable rate limiting
+	}
 }
 
 // applicationDependencies bundles every shared resource that HTTP handlers need.
@@ -46,10 +51,17 @@ func main() {
 	flag.StringVar(&settings.environment, "env", "development", "Environment(development|staging|production)")
 	flag.StringVar(&settings.db.dsn, "db-dsn", "postgres://clms:clms@localhost/clms?sslmode=disable", "PostgreSQL DSN")
 
+	// Rate limiter settings
+	flag.Float64Var(&settings.limiter.rps, "limiter-rps", 2, "Rate limiter maximum requests per second")
+	flag.IntVar(&settings.limiter.burst, "limiter-burst", 5, "Rate limiter maximum burst size")
+	flag.BoolVar(&settings.limiter.enabled, "limiter-enabled", true, "Enable rate limiter")
+
 	flag.Parse()
 
-	// Create a structured logger that writes human-readable text to stdout.
+	// Create a structured logger early so we can log the parsed configuration
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	logger.Info("parsed configuration", "limiter_enabled", settings.limiter.enabled, "limiter_rps", settings.limiter.rps, "limiter_burst", settings.limiter.burst)
 
 	// Open and verify the database connection pool.
 	db, err := openDB(settings)
